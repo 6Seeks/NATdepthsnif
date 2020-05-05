@@ -6,11 +6,18 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"runtime/debug"
+	"strconv"
+	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
+	"github.com/google/gopacket/pcapgo"
+
+	"net/http"
+	_ "net/http/pprof"
 )
 
 var (
@@ -24,8 +31,10 @@ var (
 	inactiveRecv                  *pcap.InactiveHandle
 	handleSend                    *pcap.Handle
 	inactiveSend                  *pcap.InactiveHandle
-	packetSourceToFilter          chan gopacket.Packet
+	packetSourceToFilter          chan PacketAndNum
 	generatePayloadTopacketOutput chan []byte
+	gorunNum                      int       = 4 // 默认4路并行
+	currentTime                   time.Time = time.Now()
 )
 
 // Raw is icmp probe payload
@@ -36,6 +45,7 @@ type Raw struct {
 	DstPort int
 	RecvTTL int
 	ID      int
+	Key     int
 }
 
 func (r *Raw) showRaw() {
@@ -43,7 +53,14 @@ func (r *Raw) showRaw() {
 	fmt.Printf("From %s : %d to %s : %d\n", r.SrcIP, r.SrcPort, r.DstIP, r.DstPort)
 	fmt.Printf("RecvTTL : %d\n", r.RecvTTL)
 	fmt.Printf("set ID : %d\n", r.ID)
+	fmt.Printf("Key : %d", r.Key)
 	fmt.Println()
+}
+
+// 保证每一个接收到的数据包的唯一性
+type PacketAndNum struct {
+	Packet gopacket.Packet
+	curKey int
 }
 
 // Payloadchecksum 获取主动探测返回报文完整性
@@ -57,7 +74,7 @@ func Payloadchecksum(bytes []byte) uint8 {
 }
 
 // 生成探测包负载
-func generatePayload(SrcMAC net.HardwareAddr, SrcIP net.IP, DstIP net.IP, SrcPort int, DstPort int, RecvTTL int) func() []byte {
+func generatePayload(SrcMAC net.HardwareAddr, SrcIP net.IP, DstIP net.IP, SrcPort int, DstPort int, RecvTTL int, curKey int) func() []byte {
 	curID := 0
 	return func() []byte {
 		buffer := gopacket.NewSerializeBuffer()
@@ -69,6 +86,7 @@ func generatePayload(SrcMAC net.HardwareAddr, SrcIP net.IP, DstIP net.IP, SrcPor
 			DstPort,
 			RecvTTL,
 			curID,
+			curKey,
 		}
 		rawbytes, _ := json.Marshal(raw)
 		SetTTL := 0 - curID - RecvTTL
@@ -80,7 +98,8 @@ func generatePayload(SrcMAC net.HardwareAddr, SrcIP net.IP, DstIP net.IP, SrcPor
 			SetTTL = 255 + SetTTL
 		}
 		if SetTTL < 0 {
-			log.Fatal("SetTTL < 0")
+			fmt.Printf("SetTTL < 0, RecvTTL :%d\n", RecvTTL)
+			return nil
 		}
 		gopacket.SerializeLayers(buffer, options,
 			&layers.Ethernet{
@@ -94,15 +113,16 @@ func generatePayload(SrcMAC net.HardwareAddr, SrcIP net.IP, DstIP net.IP, SrcPor
 				TOS:        0x00000000,
 				Flags:      0x0000,
 				FragOffset: 0,
-				Id:         1,
-				DstIP:      net.IP{36, 152, 44, 95},
-				SrcIP:      localaddr,
-				TTL:        uint8(SetTTL),
-				Protocol:   layers.IPProtocolICMPv4,
+				Id:         uint16(curID),
+				// DstIP:      net.IP{36, 152, 44, 95},
+				DstIP:    SrcIP,
+				SrcIP:    localaddr,
+				TTL:      uint8(SetTTL),
+				Protocol: layers.IPProtocolICMPv4,
 			},
 			&layers.ICMPv4{
 				TypeCode: 0x0800,
-				Id:       2,
+				Id:       uint16(curID),
 				Seq:      0,
 			},
 			gopacket.Payload(append([]byte{Payloadchecksum(rawbytes)}, rawbytes...)),
@@ -113,75 +133,23 @@ func generatePayload(SrcMAC net.HardwareAddr, SrcIP net.IP, DstIP net.IP, SrcPor
 	}
 }
 
-func resolvePacket(packet gopacket.Packet) {
-	// fmt.Println(packet.LinkLayer())
-	// fmt.Println(packet.NetworkLayer())
-	// fmt.Println(packet.TransportLayer())
-	// fmt.Println(packet.ApplicationLayer())
-	// fmt.Println(packet.Dump())
-	// fmt.Println("__________________________________________")
-	// fmt.Println(packet.Data())
-	// fmt.Println("__________________________________________")
-	// fmt.Println(packet.Metadata())
-	// fmt.Println("__________________________________________")
-	// fmt.Println(packet.String())
-	// fmt.Println("__________________________________________")
-	// Iterate over all layers, printing out each layer type
-	// ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
-	// if ethernetLayer == nil {
-	// 	fmt.Println("no Ethernet layers")
-	// 	return
-	// }
-	// ipLayer := packet.Layer(layers.LayerTypeIPv4)
-	// if ipLayer == nil {
-	// 	fmt.Println("no IPv4 layers")
-	// 	return
-	// }
-	// udpLayer := packet.Layer(layers.LayerTypeUDP)
-	// if udpLayer == nil {
-	// 	fmt.Println("no UDP layers")
-	// 	return
-	// }
-	// // Iterate over all layers, printing out each layer type
-	// fmt.Println("All packet layers:")
-	// for _, layer := range packet.Layers() {
-	// 	fmt.Println("- ", layer.LayerType())
-	// }
-	// fmt.Println("IPv4 and UDP layers detected")
-	// ethernet, _ := ethernetLayer.(*layers.Ethernet)
-	// ip, _ := ipLayer.(*layers.IPv4)
-	// udp, _ := udpLayer.(*layers.UDP)
-	// if ethernet.SrcMAC.String() == localhardwareaddr.String() || ip.SrcIP.String() == localaddr.String() {
-	// 	fmt.Println("drop")
-	// 	return
-	// }
-	// fmt.Printf("From %s to %s \n", ethernet.SrcMAC.String(), ethernet.DstMAC.String())
-	// fmt.Printf("From %s : %d to %s : %d\n", ip.SrcIP, udp.SrcPort, ip.DstIP, udp.DstPort)
-	// fmt.Printf("TTL : %d", ip.TTL)
-	// fmt.Println()
-	// gP := generatePayload(ethernet.SrcMAC, ip.SrcIP, ip.DstIP, udp.SrcPort, udp.DstPort, ip.TTL)
-	// err = handle.WritePacketData(gP())
-	// if err != nil {
-	// 	fmt.Println(err)
-	// }
-	// err = handle.WritePacketData(gP())
-	// if err != nil {
-	// 	fmt.Println(err)
-	// }
-	// err = handle.WritePacketData(gP())
-	// if err != nil {
-	// 	fmt.Println(err)
-	// }
-
-}
-
 // filter
 // 从packetSourceToFilter接收报文，分类：
 // 第一类，被动接收报文 ，存在IP层的非主动探测返回报文
 // 第二类，主动探测返回报文，icmp报文 且raw负载的
-func filter() {
+func filter(pcapName string) {
+	// 保存探测返回报文
+	// Open output pcap file and write header
+	f, _ := os.Create(pcapName)
+	w := pcapgo.NewWriter(f)
+	w.WriteFileHeader(uint32(snapshotlen), layers.LinkTypeEthernet)
+	defer f.Close()
+	// start 过滤
 	for {
-		packet := <-packetSourceToFilter
+		packetandnum := <-packetSourceToFilter
+		packet := packetandnum.Packet
+		curKey := packetandnum.curKey
+		fmt.Println("curKey ", curKey)
 
 		ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
 		if ethernetLayer == nil {
@@ -217,6 +185,10 @@ func filter() {
 				icmpv4, _ := icmpv4Layer.(*layers.ICMPv4)
 				// 接下来检测是否是主动探测返回报文
 				icmpv4data := icmpv4.Payload
+				if len(icmpv4data) < 2 { // 补丁patch
+					fmt.Println("icmp is not reply")
+					continue
+				}
 				if icmpv4data[0] != Payloadchecksum(icmpv4data[1:]) {
 					fmt.Println("icmp is not reply")
 					continue
@@ -228,6 +200,7 @@ func filter() {
 					fmt.Println("json decode fail")
 				} else {
 					raw.showRaw()
+					w.WritePacket(packet.Metadata().CaptureInfo, packet.Data())
 				}
 
 			case layers.IPProtocolUDP:
@@ -239,10 +212,14 @@ func filter() {
 
 				// 生成探测负载
 
-				gP := generatePayload(ethernet.SrcMAC, ipv4.SrcIP, ipv4.DstIP, int(udp.SrcPort), int(udp.DstPort), int(ipv4.TTL))
+				gP := generatePayload(ethernet.SrcMAC, ipv4.SrcIP, ipv4.DstIP, int(udp.SrcPort), int(udp.DstPort), int(ipv4.TTL), curKey)
 				go func() {
 					for i := 0; i < 5; i++ {
-						generatePayloadTopacketOutput <- gP()
+						gPbufferBytes := gP()
+						if gPbufferBytes == nil {
+							break
+						}
+						generatePayloadTopacketOutput <- gPbufferBytes
 					}
 				}()
 			case layers.IPProtocolTCP:
@@ -254,10 +231,15 @@ func filter() {
 
 				// 生成探测负载
 
-				gP := generatePayload(ethernet.SrcMAC, ipv4.SrcIP, ipv4.DstIP, int(tcp.SrcPort), int(tcp.DstPort), int(ipv4.TTL))
+				gP := generatePayload(ethernet.SrcMAC, ipv4.SrcIP, ipv4.DstIP, int(tcp.SrcPort), int(tcp.DstPort), int(ipv4.TTL), curKey)
+
 				go func() {
 					for i := 0; i < 5; i++ {
-						generatePayloadTopacketOutput <- gP()
+						gPbufferBytes := gP()
+						if gPbufferBytes == nil {
+							break
+						}
+						generatePayloadTopacketOutput <- gPbufferBytes
 					}
 				}()
 			default:
@@ -266,6 +248,7 @@ func filter() {
 			}
 
 		case layers.EthernetTypeIPv6:
+			// ipv6 以后有机会再做吧
 			ipv6Layer := packet.Layer(layers.LayerTypeIPv6)
 			if ipv6Layer == nil {
 				fmt.Println("decode IPv6 fail")
@@ -317,8 +300,13 @@ func packetOutput() {
 }
 
 func main() {
-	fmt.Println("____________________init______________________")
+	fmt.Println(currentTime)
 
+	fmt.Println("____________________init______________________")
+	var curKey int // 需要回应的报文数
+	go func() {
+		http.ListenAndServe("0.0.0.0:10000", nil)
+	}()
 	//
 
 	inactiveRecv, err := pcap.NewInactiveHandle(device)
@@ -357,8 +345,10 @@ func main() {
 
 	}
 	// 避免死锁
-	packetSourceToFilter = make(chan gopacket.Packet)
+	packetSourceToFilter = make(chan PacketAndNum)
+	defer close(packetSourceToFilter)
 	generatePayloadTopacketOutput = make(chan []byte)
+	defer close(generatePayloadTopacketOutput)
 	// start
 	handleRecv, err := inactiveRecv.Activate() // after this, inactive is no longer valid
 	if err != nil {
@@ -366,10 +356,13 @@ func main() {
 		return
 	}
 	defer handleRecv.Close()
-	// // 过滤器
-	go filter()
+	// // 多个过滤器协程
+	for i := 0; i < gorunNum; i++ {
+		go filter(currentTime.String() + strconv.Itoa(i) + ".pcap")
+	}
 	go packetOutput()
 	// Use the handle as a packet source to process all packets
+	curKey = 0
 	packetSource := gopacket.NewPacketSource(handleRecv, handleRecv.LinkType())
 	for {
 		packet, err := packetSource.NextPacket()
@@ -380,8 +373,12 @@ func main() {
 			continue
 		}
 		// resolvePacket(packet)
-		packetSourceToFilter <- packet
-
+		packetandnum := PacketAndNum{
+			packet,
+			curKey,
+		}
+		packetSourceToFilter <- packetandnum
+		curKey++
 	}
 
 }
