@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -16,12 +17,11 @@ import (
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/pcapgo"
 
-	"net/http"
 	_ "net/http/pprof"
 )
 
 var (
-	device                        string = "en0"
+	device                        string = "eth0"
 	localhardwareaddr             net.HardwareAddr
 	localaddr                     net.IP
 	snapshotlen                   int  = 1024
@@ -57,7 +57,7 @@ func (r *Raw) showRaw() {
 	fmt.Println()
 }
 
-// 保证每一个接收到的数据包的唯一性
+// PacketAndNum 保证每一个接收到的数据包的唯一性
 type PacketAndNum struct {
 	Packet gopacket.Packet
 	curKey int
@@ -98,7 +98,9 @@ func generatePayload(SrcMAC net.HardwareAddr, SrcIP net.IP, DstIP net.IP, SrcPor
 			SetTTL = 255 + SetTTL
 		}
 		if SetTTL < 0 {
-			fmt.Printf("SetTTL < 0, RecvTTL :%d\n", RecvTTL)
+
+			// fmt.Printf("SetTTL < 0, RecvTTL :%d\n", RecvTTL)
+			log.Printf("SetTTL < 0, RecvTTL :%d\n", RecvTTL)
 			return nil
 		}
 		gopacket.SerializeLayers(buffer, options,
@@ -114,10 +116,11 @@ func generatePayload(SrcMAC net.HardwareAddr, SrcIP net.IP, DstIP net.IP, SrcPor
 				Flags:      0x0000,
 				FragOffset: 0,
 				Id:         uint16(curID),
-				// DstIP:      net.IP{36, 152, 44, 95},
-				DstIP:    SrcIP,
-				SrcIP:    localaddr,
-				TTL:      uint8(SetTTL),
+				DstIP:      net.IP{36, 152, 44, 95},
+				// DstIP:    SrcIP,
+				SrcIP: localaddr,
+				// TTL:      uint8(SetTTL),
+				TTL:      128,
 				Protocol: layers.IPProtocolICMPv4,
 			},
 			&layers.ICMPv4{
@@ -149,11 +152,11 @@ func filter(pcapName string) {
 		packetandnum := <-packetSourceToFilter
 		packet := packetandnum.Packet
 		curKey := packetandnum.curKey
-		fmt.Println("curKey ", curKey)
 
 		ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
 		if ethernetLayer == nil {
-			fmt.Println("decode Ethernet fail")
+			// fmt.Println("decode Ethernet fail")
+			log.Println("decode Ethernet fail")
 			continue
 		}
 		ethernet, _ := ethernetLayer.(*layers.Ethernet)
@@ -161,11 +164,13 @@ func filter(pcapName string) {
 		if ethernet.SrcMAC.String() == localhardwareaddr.String() {
 			continue
 		}
+
 		switch ethernet.EthernetType {
 		case layers.EthernetTypeIPv4:
 			ipv4Layer := packet.Layer(layers.LayerTypeIPv4)
 			if ipv4Layer == nil {
-				fmt.Println("decode IPv4 fail")
+				// fmt.Println("decode IPv4 fail")
+				log.Println("decode IPv4 fail")
 				continue
 			}
 			ipv4, _ := ipv4Layer.(*layers.IPv4)
@@ -179,44 +184,53 @@ func filter(pcapName string) {
 			case layers.IPProtocolICMPv4:
 				icmpv4Layer := packet.Layer(layers.LayerTypeICMPv4)
 				if icmpv4Layer == nil {
-					fmt.Println("decode ICMPv4 fail")
+					// fmt.Println("decode ICMPv4 fail")
+					log.Println("decode ICMPv4 fail")
 					continue
 				}
 				icmpv4, _ := icmpv4Layer.(*layers.ICMPv4)
 				// 接下来检测是否是主动探测返回报文
 				icmpv4data := icmpv4.Payload
 				if len(icmpv4data) < 2 { // 补丁patch
-					fmt.Println("icmp is not reply")
+					// fmt.Println("icmp is not reply")
+					log.Println("icmp is not reply")
 					continue
 				}
 				if icmpv4data[0] != Payloadchecksum(icmpv4data[1:]) {
-					fmt.Println("icmp is not reply")
+					// fmt.Println("icmp is not reply")
+					log.Println("icmp is not reply")
 					continue
 				}
 				// 先简单打印吧
 				raw := &Raw{}
 				err := json.Unmarshal(icmpv4data[1:], raw)
 				if err != nil {
-					fmt.Println("json decode fail")
+					// fmt.Println("json decode fail")
+					log.Println("json decode fail")
 				} else {
-					raw.showRaw()
-					w.WritePacket(packet.Metadata().CaptureInfo, packet.Data())
+					// raw.showRaw()
+					log.Printf("receive reply from Key : %d", raw.Key)
+					fmt.Println(ipv4.SrcIP, raw.Key, raw.RecvTTL)
+					go w.WritePacket(packet.Metadata().CaptureInfo, packet.Data())
 				}
 
 			case layers.IPProtocolUDP:
 				udpLayer := packet.Layer(layers.LayerTypeUDP)
 				if udpLayer == nil {
-					fmt.Println("decode UDP fail")
+					// fmt.Println("decode UDP fail")
+					log.Println("decode UDP fail")
 				}
 				udp, _ := udpLayer.(*layers.UDP)
 
 				// 生成探测负载
+				log.Println("gP : ", ipv4.SrcIP, ipv4.DstIP, int(udp.SrcPort), int(udp.DstPort), int(ipv4.TTL), curKey)
 
 				gP := generatePayload(ethernet.SrcMAC, ipv4.SrcIP, ipv4.DstIP, int(udp.SrcPort), int(udp.DstPort), int(ipv4.TTL), curKey)
 				go func() {
 					for i := 0; i < 5; i++ {
 						gPbufferBytes := gP()
 						if gPbufferBytes == nil {
+							log.Println("gP : ", ipv4.SrcIP, ipv4.DstIP, int(udp.SrcPort), int(udp.DstPort), int(ipv4.TTL), curKey, "stop at ", i)
 							break
 						}
 						generatePayloadTopacketOutput <- gPbufferBytes
@@ -225,25 +239,28 @@ func filter(pcapName string) {
 			case layers.IPProtocolTCP:
 				tcpLayer := packet.Layer(layers.LayerTypeTCP)
 				if tcpLayer == nil {
-					fmt.Println("decode TCP fail")
+					// fmt.Println("decode TCP fail")
+					log.Println("decode TCP fail")
 				}
 				tcp, _ := tcpLayer.(*layers.TCP)
 
 				// 生成探测负载
-
+				log.Println("gP:", ipv4.SrcIP, ipv4.DstIP, int(tcp.SrcPort), int(tcp.DstPort), int(ipv4.TTL), curKey)
 				gP := generatePayload(ethernet.SrcMAC, ipv4.SrcIP, ipv4.DstIP, int(tcp.SrcPort), int(tcp.DstPort), int(ipv4.TTL), curKey)
 
 				go func() {
 					for i := 0; i < 5; i++ {
 						gPbufferBytes := gP()
 						if gPbufferBytes == nil {
+							log.Println("gP : ", ipv4.SrcIP, ipv4.DstIP, int(tcp.SrcPort), int(tcp.DstPort), int(ipv4.TTL), curKey, "stop at ", i)
 							break
 						}
 						generatePayloadTopacketOutput <- gPbufferBytes
 					}
 				}()
 			default:
-				fmt.Println("no 3 layers")
+				// fmt.Println("no 3 layers")
+				log.Println("no 3 layers")
 				continue
 			}
 
@@ -251,13 +268,15 @@ func filter(pcapName string) {
 			// ipv6 以后有机会再做吧
 			ipv6Layer := packet.Layer(layers.LayerTypeIPv6)
 			if ipv6Layer == nil {
-				fmt.Println("decode IPv6 fail")
+				// fmt.Println("decode IPv6 fail")
+				log.Println("decode IPv6 fail")
 			}
 			// ipv6, _ := ipv6Layer.(*layers.IPv6)
 			// 以后在做
 			continue
 		default:
-			fmt.Println("no 2 layers")
+			// fmt.Println("no 2 layers")
+			log.Println("no 2 layers")
 			continue
 		}
 
@@ -280,8 +299,6 @@ func packetOutput() {
 	defer handleSend.Close()
 	for {
 		bytesOutput := <-generatePayloadTopacketOutput
-
-		fmt.Println("_____________output____________________")
 		for i := 0; i < 5; i++ {
 			// 每一次探测报文发送5次
 
@@ -300,14 +317,23 @@ func packetOutput() {
 }
 
 func main() {
-	fmt.Println(currentTime)
-
-	fmt.Println("____________________init______________________")
+	// fmt.Println(currentTime)
 	var curKey int // 需要回应的报文数
-	go func() {
-		http.ListenAndServe("0.0.0.0:10000", nil)
-	}()
+	// go func() {
+	// 	http.ListenAndServe("0.0.0.0:10000", nil)
+	// }()
 	//
+	flag.BoolVar(&promiscuous, "promisc", true, "switch deivce in promiscuous mode")
+	flag.StringVar(&device, "device", "eth0", "sniff device name")
+	flag.IntVar(&snapshotlen, "snapshotlen", 1024, "length of snapshot,not too long or too short")
+	flag.Parse()
+	//set logfile Stdout
+	logFile, logErr := os.OpenFile(currentTime.String()+".log", os.O_CREATE|os.O_RDWR|os.O_APPEND, 0666)
+	if logErr != nil {
+		fmt.Println("Fail to find", *logFile, "cServer start Failed")
+		os.Exit(1)
+	}
+	log.SetOutput(logFile)
 
 	inactiveRecv, err := pcap.NewInactiveHandle(device)
 	if err != nil {
@@ -328,13 +354,13 @@ func main() {
 
 	loaclinterface, err := net.InterfaceByName(device)
 	if err != nil {
-		fmt.Println(err)
+		log.Fatal(err)
 		return
 	}
 	localhardwareaddr = loaclinterface.HardwareAddr
 	addrs, err := loaclinterface.Addrs()
 	if err != nil {
-		fmt.Println(err)
+		log.Fatal(err)
 		return
 	}
 	for i := range addrs {
@@ -369,7 +395,8 @@ func main() {
 		if err == io.EOF {
 			break
 		} else if err != nil {
-			fmt.Println(err)
+			// fmt.Println(err)
+			log.Panicln(err)
 			continue
 		}
 		// resolvePacket(packet)
