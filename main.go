@@ -1,12 +1,29 @@
 package main
 
 import (
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/willf/bloom"
+)
+
+// 全局变量
+var (
+	PItoFC        chan PItoFCchan
+	FCtoGP        chan FCtoGPchan
+	FCtoWF        chan FCtoWFchan
+	GPtoPO        chan GPtoPOchan
+	PItoFCrunflag chan bool
+	FCtoGPrunflag chan bool
+	FCtoWFrunflag chan bool
+	GPtoPOrunflag chan bool
+	wg            sync.WaitGroup
 )
 
 func main() {
@@ -15,19 +32,24 @@ func main() {
 	// FC : FilterClassifier
 	// GP : GeneratePayload
 	// WF : WriteFile
-	var (
-		PItoFC chan PItoFCchan
-		FCtoGP chan FCtoGPchan
-		FCtoWF chan FCtoWFchan
-		GPtoPO chan GPtoPOchan
-		wg     sync.WaitGroup
-	)
 	// 整个系统初始化
-	SystemINIT("eth0", "eth1")
+	SystemINIT("en0", "en0")
 	PItoFC = make(chan PItoFCchan, 100)
 	FCtoGP = make(chan FCtoGPchan, 100)
 	FCtoWF = make(chan FCtoWFchan, 100)
 	GPtoPO = make(chan GPtoPOchan, 100)
+	PItoFCrunflag = make(chan bool, 100)
+	FCtoGPrunflag = make(chan bool, 100)
+	FCtoWFrunflag = make(chan bool, 100)
+	GPtoPOrunflag = make(chan bool, 100)
+	defer close(PItoFC)
+	defer close(FCtoGP)
+	defer close(FCtoWF)
+	defer close(GPtoPO)
+	defer close(PItoFCrunflag)
+	defer close(FCtoGPrunflag)
+	defer close(FCtoWFrunflag)
+	defer close(GPtoPOrunflag)
 	PI := PacketInput{}
 	FC := FilterClassifier{}
 	WF := WriteFile{}
@@ -43,28 +65,34 @@ func main() {
 		os.Exit(1)
 	}
 	GP.init()
-	PO.init(SendDevice, 4)
+	PO.init(SendDevice, 3)
 	// wait group
 	wg.Add(5)
+	//
+	start := time.Now().Unix()
 	// PacketInput
 	go func() {
-		var curID interface{}
+		var runflag bool
+		var count uint64
 		var data []byte
 		var ci gopacket.CaptureInfo
 		for {
-			curID, data, ci = PI.recv()
-			PItoFC <- PItoFCchan{
-				CurID: curID,
-				Data:  data,
-				Ci:    ci,
-			}
-			if curID == false {
+
+			runflag, count, data, ci = PI.recv(100)
+			PItoFCrunflag <- runflag
+			if runflag == false {
 				PI.handleRecv.Close()
 				PI.inactiveRecv.CleanUp()
 				break // 计数器用完了
 			}
-			log.Println("PacketInput ", curID)
+			PItoFC <- PItoFCchan{
+				Data: data,
+				Ci:   ci,
+			}
+
 		}
+		// log.Println("PI packets ", count)
+		fmt.Println("PI packets ", count)
 		wg.Done()
 	}()
 	// FilterClassifier
@@ -72,99 +100,163 @@ func main() {
 
 		var piresult PItoFCchan
 		var fctype FILETRTYPE
-		var fcret1 interface{}
-		var fcret2 interface{}
+		var fc FilterClassifier
+		var curID uint32
+		var runflag bool
+		// bloom filter
+		// 10000000	个包不超过0.01的假阳率
+		bf := bloom.NewWithEstimates(10000000, 0.01)
+		fmt.Println(bf.Cap(), bf.K())
+		curID = 0
 		for {
-			piresult = <-PItoFC
-			fctype, fcret1, fcret2 = FC.run(piresult.Data)
-			if piresult.CurID == false {
-				FCtoGP <- FCtoGPchan{
-					CurID:      piresult.CurID,
-					RecvSrcMAC: fcret1.(layers.Ethernet).SrcMAC,
-					RecvSrcIP:  fcret2.(layers.IPv4).SrcIP,
-					RecvTTL:    int(fcret2.(layers.IPv4).TTL),
-				}
-				FCtoWF <- FCtoWFchan{
-					Run:  false,
-					Data: piresult.Data,
-					Ci:   piresult.Ci,
-				}
+			runflag = <-PItoFCrunflag
+			if runflag == false {
 				// 出口
+				FCtoGPrunflag <- runflag
+				FCtoWFrunflag <- runflag
 				break
 			}
-			log.Println("FilterClassifier ", piresult.CurID)
+			piresult = <-PItoFC
+
+			fctype, fc = FC.run(piresult.Data)
+
 			switch fctype {
 			case OTHER:
 				continue
 			case IPTCP, IPUDP:
-				FCtoGP <- FCtoGPchan{
-					CurID:      piresult.CurID,
-					RecvSrcMAC: fcret1.(layers.Ethernet).SrcMAC,
-					RecvSrcIP:  fcret2.(layers.IPv4).SrcIP,
-					RecvTTL:    int(fcret2.(layers.IPv4).TTL),
+				// 布隆过滤器
+				if curID%1000000 == 0 {
+					bf.ClearAll()
 				}
+				if bf.Test(append(piresult.Data[26:38], piresult.Data[23])) {
+					continue
+				}
+				bf.Add(append(piresult.Data[26:38], piresult.Data[23]))
+				// 通过过滤器的才进行以下内容
+				FCtoGP <- FCtoGPchan{
+					CurID:      curID,
+					RecvSrcMAC: fc.eth.SrcMAC,
+					RecvSrcIP:  fc.ip.SrcIP,
+					RecvTTL:    int(fc.ip.TTL),
+				}
+				// 可以统计2^32次方个有效包
+				FCtoGPrunflag <- runflag
+				curID++
+
 			case IPICMP:
+				var recvKey int
+				var recvCurID uint32
+				if fc.icmp.TypeCode == 0x0000 && PayloadChecksum(fc.icmp.Payload[1:]) == fc.icmp.Payload[0] {
+					// icmp reply
+					var raw Raw
+					json.Unmarshal(fc.icmp.Payload[1:], &raw)
+					recvKey = raw.Key
+					recvCurID = raw.ID
+					if recvCurID != IDKEYdecode(fc.icmp.Id, fc.icmp.Seq) {
+						log.Println("warming IPICMP")
+					}
+				} else if fc.icmp.TypeCode == 0x0b00 {
+					// TTL exceed
+					recvKey = int(binary.BigEndian.Uint16(fc.icmp.Payload[4:6])) // ip id
+					recvCurID = binary.BigEndian.Uint32(fc.icmp.Payload[24:28])  // icmp id + seq
+				}
 				FCtoWF <- FCtoWFchan{
-					Run:  true,
-					Data: piresult.Data,
-					Ci:   piresult.Ci,
+
+					Data:         piresult.Data,
+					Ci:           piresult.Ci,
+					RecvCurID:    recvCurID,
+					RecvKey:      recvKey,
+					RecvTypeCode: fc.icmp.TypeCode,
+				}
+				FCtoWFrunflag <- runflag
+			}
+
+		}
+		fmt.Println("curID", curID)
+		wg.Done()
+	}()
+	// WriteFile
+	go func() {
+		var fcresult FCtoWFchan
+		var runflag bool
+		var FileData = make(map[uint32][]int8)
+		for {
+			runflag = <-FCtoWFrunflag
+			if runflag == false {
+				WF.f.Close()
+				break
+			}
+			fcresult = <-FCtoWF
+
+			// log.Println("WriteFile  RecvCurID, RecvKey, RecvTypeCode", fcresult.RecvCurID, fcresult.RecvKey, fcresult.RecvTypeCode.String())
+			// 1 reply
+			// 0 no response
+			// -1 ttl exceed
+			if _, ok := FileData[fcresult.RecvCurID]; !ok {
+				// 没有创建
+				FileData[fcresult.RecvCurID] = []int8{-1, -1, -1, -1, -1}
+			}
+			if fcresult.RecvTypeCode == 0x0000 {
+				FileData[fcresult.RecvCurID][fcresult.RecvKey] = 1
+			} else if fcresult.RecvTypeCode == 0x0b00 && FileData[fcresult.RecvCurID][fcresult.RecvKey] != 1 {
+
+				FileData[fcresult.RecvCurID][fcresult.RecvKey] = 0
+			}
+
+			// WF.write(fcresult.Data, fcresult.Ci)
+
+		}
+		fmt.Println(FileData)
+
+		wg.Done()
+	}()
+	// GeneratePayload
+	go func() {
+		var fcresult FCtoGPchan
+		var runflag bool
+		for {
+			runflag = <-FCtoGPrunflag
+			if runflag == false {
+				GPtoPOrunflag <- runflag
+				break
+			}
+			fcresult = <-FCtoGP
+			// log.Println("GeneratePayload ", fcresult.CurID)
+			GP.config(fcresult.RecvSrcMAC, fcresult.RecvSrcIP, fcresult.RecvTTL, fcresult.CurID)
+			for i := 0; i < 5; i++ { // 4层 dynamic TTL
+
+				GPtoPO <- GPtoPOchan{
+					Data:  GP.generate(),
+					CurID: fcresult.CurID,
+				}
+				GPtoPOrunflag <- runflag
+				ok := GP.update()
+				if !ok {
+					break
 				}
 			}
 
 		}
 		wg.Done()
 	}()
-	// WriteFile
-	go func() {
-		var fcresult FCtoWFchan
-		for {
-			fcresult = <-FCtoWF
-			if fcresult.Run == false {
-				WF.f.Close()
-				break
-			}
-			log.Println("WriteFile ")
-			WF.write(fcresult.Data, fcresult.Ci)
-		}
-		wg.Done()
-	}()
-	// GeneratePayload
-	go func() {
-		var fcresult FCtoGPchan
-		for {
-			fcresult = <-FCtoGP
-			log.Println("GeneratePayload ", fcresult.CurID)
-			GP.config(fcresult.RecvSrcMAC, fcresult.RecvSrcIP, fcresult.RecvTTL, fcresult.CurID.(uint64))
-			for i := 0; i < 4; i++ {
-				GPtoPO <- GPtoPOchan{
-					Run:  !(fcresult.CurID == false),
-					Data: GP.generate(),
-				}
-				GP.generate()
-				if ok := GP.update(); !ok {
-					break
-				}
-			}
-			if fcresult.CurID == false {
-				break
-			}
-		}
-		wg.Done()
-	}()
 	// PacketOutput
 	go func() {
 		var gpresult GPtoPOchan
+		var runflag bool
 		for {
-			gpresult = <-GPtoPO
-			if gpresult.Run == false {
+			runflag = <-GPtoPOrunflag
+			if runflag == false {
 				PO.handleSend.Close()
 				PO.inactiveSend.CleanUp()
 				break
 			}
-			log.Println("PacketOutput ")
+			gpresult = <-GPtoPO
+			// log.Println("PacketOutput ", gpresult.CurID, gpresult.Data[22])
 			PO.send(gpresult.Data)
+
 		}
 		wg.Done()
 	}()
 	wg.Wait()
+	fmt.Println(time.Now().Unix() - start)
 }

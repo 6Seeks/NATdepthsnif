@@ -28,25 +28,16 @@ var (
 )
 
 // IDKEYencode encode ID seq
-func IDKEYencode(ID uint64, Key int) (uint16, uint16, uint16) {
-	// IPID uint16 ,ICMP ID uint16,ICMP seq uint16 = 48 bit
-	// curKey>>2 will take low 2bit , curID can take 46 bit
-	// get bytes
-	var tmp uint64
-	tmp = ID<<2 + uint64(Key)
-	IPID := uint16(tmp >> 32)
-	ICMPID := uint16((tmp >> 16) & 0xffff)
-	ICMPseq := uint16(tmp & 0xffff)
-	return IPID, ICMPID, ICMPseq
+func IDKEYencode(ID uint32) (uint16, uint16) {
+	//ICMP ID uint16,ICMP seq uint16 = 32 bit
+	return uint16((ID >> 16) & 0xffff), uint16(ID & 0xffff)
 }
 
 // IDKEYdecode decode ID seq
-func IDKEYdecode(IPID uint16, ICMPID uint16, ICMPseq uint16) (uint64, int) {
-	var tmp uint64
-	tmp = uint64(IPID)<<32 + uint64(ICMPID)<<16 + uint64(ICMPseq)
-	ID := tmp >> 2
-	Key := int(tmp & 0x3)
-	return ID, Key
+func IDKEYdecode(ICMPID uint16, ICMPseq uint16) uint32 {
+
+	return uint32(ICMPID)<<16 + uint32(ICMPseq)
+
 }
 
 // PayloadChecksum 获取主动探测返回报文完整性
@@ -90,11 +81,10 @@ func (fc *FilterClassifier) init() {
 
 }
 
-func (fc *FilterClassifier) run(data []byte) (FILETRTYPE, interface{}, interface{}) {
-
+func (fc *FilterClassifier) run(data []byte) (FILETRTYPE, FilterClassifier) {
 	err = fc.parser.DecodeLayers(data, &fc.decodedLayers)
 	if err != nil {
-		log.Println("Error DecodeLayer :", err)
+		// log.Println("Error DecodeLayer :", err)
 	}
 	for i := 0; i < len(fc.decodedLayers); i++ {
 		typ := fc.decodedLayers[i]
@@ -102,35 +92,37 @@ func (fc *FilterClassifier) run(data []byte) (FILETRTYPE, interface{}, interface
 		case layers.LayerTypeEthernet:
 			// 如果是自己发送的 直接返回 other
 			if fc.eth.SrcMAC.String() == RecvHardwareAddr.String() || fc.eth.SrcMAC.String() == SendHardwareAddr.String() {
-				return OTHER, nil, nil
+				return OTHER, *fc
 			}
 		case layers.LayerTypeIPv4:
 			// 如果是自己发送的 直接返回 other
 			if fc.ip.SrcIP.Equal(RecvIP) || fc.ip.SrcIP.Equal(SendIP) {
-				return OTHER, nil, nil
+				return OTHER, *fc
 			}
 		case layers.LayerTypeUDP:
-			log.Println("    UDP ", fc.udp.SrcPort, fc.udp.DstPort)
-			return IPUDP, fc.eth, fc.ip
+			// log.Println("    UDP ", fc.udp.SrcPort, fc.udp.DstPort)
+
+			return IPUDP, *fc
 		case layers.LayerTypeTCP:
-			log.Println("    TCP ", fc.tcp.SrcPort, fc.tcp.DstPort)
-			return IPTCP, fc.eth, fc.ip
+			// log.Println("    TCP ", fc.tcp.SrcPort, fc.tcp.DstPort)
+
+			return IPTCP, *fc
 		case layers.LayerTypeICMPv4:
-			log.Println("    ICMP ", fc.icmp.TypeCode)
+			// log.Println("    ICMP ", fc.icmp.TypeCode)
 			// 需要一些判断条件
 			// 只有是发给自己的才收
 			if fc.ip.DstIP.Equal(RecvIP) {
-				return IPICMP, nil, nil
+				return IPICMP, *fc
 			}
-			return OTHER, nil, nil
+			return OTHER, *fc
 		}
 	}
-	return OTHER, nil, nil
+	return OTHER, *fc
 }
 
 // FCtoGPchan FilterClassifier to GeneratePayload
 type FCtoGPchan struct {
-	CurID      interface{}
+	CurID      uint32
 	RecvSrcMAC net.HardwareAddr
 	RecvSrcIP  net.IP
 	RecvTTL    int
@@ -140,14 +132,14 @@ type FCtoGPchan struct {
 type Raw struct {
 	RecvSrcIP string
 	RecvTTL   int
-	ID        uint64
+	ID        uint32
 	Key       int
 }
 
 // GeneratePayload class
 type GeneratePayload struct {
 	curKey   int
-	curID    uint64
+	curID    uint32
 	buffer   gopacket.SerializeBuffer
 	options  gopacket.SerializeOptions
 	raw      Raw
@@ -160,7 +152,6 @@ type GeneratePayload struct {
 
 // GeneratePayload 初始化
 func (GP *GeneratePayload) init() {
-	GP.buffer = gopacket.NewSerializeBuffer()
 	GP.options = gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
 	GP.eth.EthernetType = layers.EthernetTypeIPv4
 	GP.eth.SrcMAC = SendHardwareAddr
@@ -191,17 +182,14 @@ func (GP *GeneratePayload) init() {
 	// Seq:      ICMPseq,
 	GP.icmp.TypeCode = layers.CreateICMPv4TypeCode(layers.ICMPv4TypeEchoRequest, layers.ICMPv4CodeNet)
 }
-func (GP *GeneratePayload) config(RecvSrcMAC net.HardwareAddr, RecvSrcIP net.IP, RecvTTL int, curID uint64) {
+func (GP *GeneratePayload) config(RecvSrcMAC net.HardwareAddr, RecvSrcIP net.IP, RecvTTL int, curID uint32) {
+	GP.curKey = 0
+	GP.curID = curID
 	// 给特定数据包初值
 	// 本数据包内固定值
 	GP.eth.DstMAC = RecvSrcMAC
 	GP.ip.DstIP = RecvSrcIP
-	GP.raw.ID = curID
-	GP.raw.RecvSrcIP = RecvSrcIP.String()
-	GP.raw.RecvTTL = RecvTTL
-	// 本数据包内动态值的初始化
-	GP.curKey = 0
-	GP.raw.Key = GP.curKey
+	GP.ip.Id = uint16(GP.curKey)
 	if RecvTTL < 64 {
 		GP.ip.TTL = 64
 	} else if RecvTTL < 128 {
@@ -209,9 +197,16 @@ func (GP *GeneratePayload) config(RecvSrcMAC net.HardwareAddr, RecvSrcIP net.IP,
 	} else {
 		GP.ip.TTL = 255
 	}
-	GP.ip.TTL = GP.ip.TTL - uint8(RecvTTL) + 1
 
-	GP.ip.Id, GP.icmp.Id, GP.icmp.Seq = IDKEYencode(GP.raw.ID, GP.curKey)
+	GP.ip.TTL = GP.ip.TTL - uint8(RecvTTL) + 1
+	//
+	GP.raw.Key = GP.curKey
+	GP.raw.ID = curID
+	GP.raw.RecvSrcIP = RecvSrcIP.String()
+	GP.raw.RecvTTL = RecvTTL
+	// 本数据包内动态值的初始化
+
+	GP.icmp.Id, GP.icmp.Seq = IDKEYencode(GP.raw.ID)
 	GP.rawbytes, _ = json.Marshal(GP.raw)
 	GP.payload = append([]byte{PayloadChecksum(GP.rawbytes)}, GP.rawbytes...)
 
@@ -219,6 +214,7 @@ func (GP *GeneratePayload) config(RecvSrcMAC net.HardwareAddr, RecvSrcIP net.IP,
 
 func (GP *GeneratePayload) update() bool {
 	GP.curKey++
+	GP.ip.Id = uint16(GP.curKey)
 	GP.raw.Key = GP.curKey
 	GP.ip.TTL--
 	if GP.curKey >= 4 {
@@ -227,15 +223,15 @@ func (GP *GeneratePayload) update() bool {
 	if GP.ip.TTL <= 0 {
 		return false
 	}
-	GP.ip.Id, GP.icmp.Id, GP.icmp.Seq = IDKEYencode(GP.raw.ID, GP.curKey)
+	GP.icmp.Id, GP.icmp.Seq = IDKEYencode(GP.curID)
 	GP.rawbytes, _ = json.Marshal(GP.raw)
 	GP.payload = append([]byte{PayloadChecksum(GP.rawbytes)}, GP.rawbytes...)
 	return true
 }
 func (GP *GeneratePayload) generate() []byte {
-
-	gopacket.SerializeLayers(GP.buffer, GP.options, &GP.eth, &GP.ip, &GP.icmp, GP.payload)
-	return GP.buffer.Bytes()
+	buffer := gopacket.NewSerializeBuffer()
+	gopacket.SerializeLayers(buffer, GP.options, &GP.eth, &GP.ip, &GP.icmp, GP.payload)
+	return buffer.Bytes()
 }
 
 // // GeneratePayload 闭包实现
@@ -338,17 +334,15 @@ func (PO *PacketOutput) send(data []byte) {
 
 // GPtoPOchan GeneratePayload to PacketOutput
 type GPtoPOchan struct {
-	Run  bool
-	Data []byte
+	CurID uint32
+	Data  []byte
 }
 
 // PacketInput recv packet class
 type PacketInput struct {
 	inactiveRecv *pcap.InactiveHandle
 	handleRecv   *pcap.Handle
-	curID        uint64
-	data         []byte
-	ci           gopacket.CaptureInfo
+	count        uint64
 }
 
 func (PI *PacketInput) init(device string) bool {
@@ -370,24 +364,24 @@ func (PI *PacketInput) init(device string) bool {
 		log.Fatal(err)
 		return false
 	}
-	PI.curID = 0
+	PI.count = 0
 	return true
 }
 
-func (PI *PacketInput) recv() (interface{}, []byte, gopacket.CaptureInfo) {
-	PI.data, PI.ci, err = PI.handleRecv.ReadPacketData()
-	PI.curID++
-	if 1<<46-PI.curID <= 0 {
-		return false, PI.data, PI.ci
+func (PI *PacketInput) recv(count uint64) (bool, uint64, []byte, gopacket.CaptureInfo) {
+	data, ci, _ := PI.handleRecv.ReadPacketData()
+
+	PI.count++
+	if PI.count > count {
+		return false, PI.count, data, ci
 	}
-	return PI.curID, PI.data, PI.ci
+	return true, PI.count, data, ci
 }
 
 // PItoFCchan PacketInput to FilterClassifier
 type PItoFCchan struct {
-	CurID interface{}
-	Data  []byte
-	Ci    gopacket.CaptureInfo
+	Data []byte
+	Ci   gopacket.CaptureInfo
 }
 
 // WriteFile write packet to pcap
@@ -417,9 +411,11 @@ func (WF *WriteFile) write(data []byte, ci gopacket.CaptureInfo) {
 
 // FCtoWFchan FilterClassifier to WriteFile
 type FCtoWFchan struct {
-	Run  bool
-	Data []byte
-	Ci   gopacket.CaptureInfo
+	Data         []byte
+	Ci           gopacket.CaptureInfo
+	RecvCurID    uint32
+	RecvKey      int
+	RecvTypeCode layers.ICMPv4TypeCode
 }
 
 // SystemINIT 对整个系统初始化
